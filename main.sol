@@ -16,13 +16,15 @@ contract AdvancedAuction {
     struct Bid {
         uint256 amount;
         bool secret;
+        address bidder;
     }
 
     mapping(address => Bid) private bids;
-    mapping(address => uint256) private refunds;
+    Bid[] private refunds;
 
     event NewBid(address indexed bidder, uint256 bid, bool secret);
     event AuctionEnded(address winner, uint256 bid);
+    event RefundProcessed(address bidder, uint256 refundAmount);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only the owner can call this function");
@@ -63,10 +65,6 @@ contract AdvancedAuction {
         return isAuctionActive;
     }
 
-    function getRefund(address bidder) public view returns (uint256) {
-        return refunds[bidder];
-    }
-
     function startAuction(
         uint256 _startingBid,
         uint256 _startAt,
@@ -95,11 +93,9 @@ contract AdvancedAuction {
             "There needs to be a higher bid"
         );
 
-        if (highestBidder != address(0)) {
-            refunds[highestBidder] += highestBidAmount;
-        }
-
-        bids[msg.sender] = Bid(msg.value, _secret);
+        Bid memory newBid = Bid(msg.value, _secret, msg.sender);
+        bids[msg.sender] = newBid;
+        refunds.push(newBid);
         highestBidder = msg.sender;
 
         emit NewBid(msg.sender, msg.value, _secret);
@@ -112,18 +108,67 @@ contract AdvancedAuction {
             "Auction has not ended yet"
         );
 
+        // Processing refunds for all except the highest bidder.
+        for (uint256 i = 0; i < refunds.length; i++) {
+            if (refunds[i].bidder != highestBidder) {
+                uint256 refundAmount = refunds[i].amount;
+                // Calculating 2% commission.
+                uint256 commission = (refundAmount * 2) / 100;
+                uint256 refundNetCommission = refundAmount - commission;
+
+                // Ensure safe transfer of funds.
+                (bool success, ) = payable(refunds[i].bidder).call{
+                    value: refundNetCommission
+                }("");
+                require(success, "Failed to send refund");
+
+                emit RefundProcessed(refunds[i].bidder, refundNetCommission);
+            }
+        }
+
+        // Mark the auction as not active and update the nftAssetOwner.
         isAuctionActive = false;
         nftAssetOwner = highestBidder;
         emit AuctionEnded(highestBidder, bids[highestBidder].amount);
     }
 
     function withdraw() public {
-        uint256 amount = refunds[msg.sender];
+        // Prevent the highest bidder from withdrawing their bid during the auction.
+        // This is crucial for maintaining the integrity of the auction, ensuring that the highest bid
+        // remains valid and locked until the auction is finalized. It prevents the highest bidder from
+        // retracting their winning bid, which could undermine the auction process.
+        require(
+            msg.sender != highestBidder,
+            "Highest bidder cannot withdraw funds"
+        );
 
-        require(amount > 0, "No funds to withdraw");
+        // Initialize a variable to track if a refund has been processed.
+        bool refundProcessed = false;
+        uint256 refundAmount = 0;
 
-        refunds[msg.sender] = 0;
-        // Deducting 2% commission
-        payable(msg.sender).transfer((amount * 98) / 100);
+        for (uint256 i = 0; i < refunds.length; i++) {
+            if (refunds[i].bidder == msg.sender) {
+                refundAmount = refunds[i].amount;
+                require(refundAmount > 0, "No funds to withdraw");
+
+                // Calculate the amount to refund after deducting a 2% commission
+                uint256 refundNetCommission = (refundAmount * 98) / 100;
+                refunds[i].amount = 0;
+
+                // Send the refund, ensuring to handle failure as per EIP-1884 / EIP-2929
+                (bool success, ) = payable(msg.sender).call{
+                    value: refundNetCommission
+                }("");
+                require(success, "Transfer failed");
+
+                emit RefundProcessed(refunds[i].bidder, refundNetCommission);
+
+                refundProcessed = true;
+                break;
+            }
+        }
+
+        // Ensure that a refund was indeed processed
+        require(refundProcessed, "No eligible refund found for this address");
     }
 }
